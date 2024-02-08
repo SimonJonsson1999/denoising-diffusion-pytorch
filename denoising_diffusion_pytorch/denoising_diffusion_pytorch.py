@@ -615,9 +615,11 @@ class GaussianDiffusion(nn.Module):
 
     def q_posterior(self, x_start, x_t, t):
         posterior_mean = (
-            extract(self.posterior_mean_coef1, t, x_t.shape) * x_start +
+            extract(self.posterior_mean_coef1, t, x_t.shape) * x_start + #####TODO Equation 7 from the paper
             extract(self.posterior_mean_coef2, t, x_t.shape) * x_t
-        )
+        ) 
+        # register_buffer('posterior_mean_coef1', betas * torch.sqrt(alphas_cumprod_prev) / (1. - alphas_cumprod))
+        # register_buffer('posterior_mean_coef2', (1. - alphas_cumprod_prev) * torch.sqrt(alphas) / (1. - alphas_cumprod))
         posterior_variance = extract(self.posterior_variance, t, x_t.shape)
         posterior_log_variance_clipped = extract(self.posterior_log_variance_clipped, t, x_t.shape)
         return posterior_mean, posterior_variance, posterior_log_variance_clipped
@@ -663,14 +665,14 @@ class GaussianDiffusion(nn.Module):
         batched_times = torch.full((b,), t, device = device, dtype = torch.long)
         model_mean, _, model_log_variance, x_start = self.p_mean_variance(x = x, t = batched_times, x_self_cond = x_self_cond, clip_denoised = True)
         noise = torch.randn_like(x) if t > 0 else 0. # no noise if t == 0
-        pred_img = model_mean + (0.5 * model_log_variance).exp() * noise
+        pred_img = model_mean + (0.5 * model_log_variance).exp() * noise  ##TODO STEP 4
         return pred_img, x_start
 
     @torch.inference_mode()
     def p_sample_loop(self, shape, return_all_timesteps = False):
         batch, device = shape[0], self.device
 
-        img = torch.randn(shape, device = device)
+        img = torch.randn(shape, device = device) #TODO Step 1
         imgs = [img]
 
         x_start = None
@@ -765,7 +767,7 @@ class GaussianDiffusion(nn.Module):
     def p_losses(self, x_start, t, noise = None, offset_noise_strength = None):
         b, c, h, w = x_start.shape
 
-        noise = default(noise, lambda: torch.randn_like(x_start))
+        noise = default(noise, lambda: torch.randn_like(x_start)) ###TODO STEP 4
 
         # offset noise - https://www.crosslabs.org/blog/diffusion-with-offset-noise
 
@@ -777,7 +779,7 @@ class GaussianDiffusion(nn.Module):
 
         # noise sample
 
-        x = self.q_sample(x_start = x_start, t = t, noise = noise)
+        x = self.q_sample(x_start = x_start, t = t, noise = noise)            ##TODO ########### STEP 2 and creating x = sqrt/(alpha_t)*x0 + sqrt(1 + alpha_t)*eps
 
         # if doing self-conditioning, 50% of the time, predict x_start from current set of times
         # and condition with unet with that
@@ -791,7 +793,7 @@ class GaussianDiffusion(nn.Module):
 
         # predict and take gradient step
 
-        model_out = self.model(x, t, x_self_cond)
+        model_out = self.model(x, t, x_self_cond) #TODO### x = sqrt/(alpha_t)*x0 + sqrt(1 + alpha_t)*eps
 
         if self.objective == 'pred_noise':
             target = noise
@@ -812,14 +814,14 @@ class GaussianDiffusion(nn.Module):
     def forward(self, img, *args, **kwargs):
         b, c, h, w, device, img_size, = *img.shape, img.device, self.image_size
         assert h == img_size and w == img_size, f'height and width of image must be {img_size}'
-        t = torch.randint(0, self.num_timesteps, (b,), device=device).long()
+        t = torch.randint(0, self.num_timesteps, (b,), device=device).long()   ##########TODO STEP 3
 
         img = self.normalize(img)
         return self.p_losses(img, t, *args, **kwargs)
 
 # dataset classes
 
-class Dataset(Dataset):
+class Dataset1(Dataset):
     def __init__(
         self,
         folder,
@@ -850,6 +852,42 @@ class Dataset(Dataset):
         path = self.paths[index]
         img = Image.open(path)
         return self.transform(img)
+    
+
+class Dataset_own(Dataset):
+    def __init__(
+        self,
+        folder,
+        image_size,
+        exts = ['jpg', 'jpeg', 'png', 'tiff'],
+        augment_horizontal_flip = False,
+        convert_image_to = None
+    ):
+        super().__init__()
+        self.folder = folder
+        self.image_size = image_size
+        self.paths = [p for ext in exts for p in Path(f'{folder}').glob(f'**/*.{ext}') if 'front' in p.name]
+        # print(len(self.paths))
+
+        maybe_convert_fn = partial(convert_image_to_fn, convert_image_to) if exists(convert_image_to) else nn.Identity()
+
+        self.transform = T.Compose([
+            T.Lambda(maybe_convert_fn),
+            T.Resize(image_size),
+            T.RandomHorizontalFlip() if augment_horizontal_flip else nn.Identity(),
+            T.CenterCrop(image_size),
+            T.ToTensor()
+        ])
+
+    def __len__(self):
+        return len(self.paths)
+
+    def __getitem__(self, index):
+        path = self.paths[index]
+        img = Image.open(path)
+        return self.transform(img)
+    
+
 
 # trainer class
 
@@ -878,7 +916,8 @@ class Trainer(object):
         inception_block_idx = 2048,
         max_grad_norm = 1.,
         num_fid_samples = 50000,
-        save_best_and_latest_only = False
+        save_best_and_latest_only = False,
+        own = True
     ):
         super().__init__()
 
@@ -890,7 +929,7 @@ class Trainer(object):
         )
 
         # model
-
+        self.own = own
         self.model = diffusion_model
         self.channels = diffusion_model.channels
         is_ddim_sampling = diffusion_model.is_ddim_sampling
@@ -916,8 +955,10 @@ class Trainer(object):
         self.max_grad_norm = max_grad_norm
 
         # dataset and dataloader
-
-        self.ds = Dataset(folder, self.image_size, augment_horizontal_flip = augment_horizontal_flip, convert_image_to = convert_image_to)
+        if self.own:
+             self.ds = Dataset_own(folder, self.image_size, augment_horizontal_flip = augment_horizontal_flip, convert_image_to = convert_image_to)
+        else:
+            self.ds = Dataset(folder, self.image_size, augment_horizontal_flip = augment_horizontal_flip, convert_image_to = convert_image_to)
 
         assert len(self.ds) >= 100, 'you should have at least 100 images in your folder. at least 10k images recommended'
 
